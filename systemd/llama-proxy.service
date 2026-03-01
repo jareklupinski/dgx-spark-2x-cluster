@@ -1,3 +1,6 @@
+# llama-proxy.service — MASTER node
+# NOTE: setup-openclaw.sh generates this with correct paths/user.
+#       This file is a reference template.
 [Unit]
 Description=llama-proxy (role rewrite + thinking control, port 8000→8001)
 After=network.target llama-server.service
@@ -6,7 +9,7 @@ Requires=llama-server.service
 [Service]
 Type=simple
 User=YOUR_USERNAME
-ExecStart=/path/to/python3 /opt/llama.cpp/llama-proxy.py
+ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/llama.cpp/llama-proxy.py
 Restart=on-failure
 RestartSec=5
 StandardOutput=append:/var/log/llama-proxy.log

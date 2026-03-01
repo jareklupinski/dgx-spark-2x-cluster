@@ -1,0 +1,23 @@
+# llama-rpc-worker.service — WORKER node
+# Copy to /etc/systemd/system/ on the worker Spark:
+#   sudo cp systemd/llama-rpc-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now llama-rpc-worker
+#
+# Replace YOUR_USERNAME and WORKER_IP with your actual values.
+[Unit]
+Description=llama.cpp RPC Worker (distributed inference)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+Environment=PATH=/usr/local/cuda/bin:/usr/bin:/bin
+ExecStart=/home/YOUR_USERNAME/llama.cpp/build/bin/rpc-server --host WORKER_IP --port 50052 -c
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/llama-rpc-worker.log
+StandardError=append:/var/log/llama-rpc-worker.log
+
+[Install]
+WantedBy=multi-user.target

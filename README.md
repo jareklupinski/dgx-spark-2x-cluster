@@ -1,17 +1,42 @@
-# llama.cpp + openclaw on NVIDIA DGX Spark (GB10)
+# llama.cpp + openclaw on 2× NVIDIA DGX Spark (GB10)
 
-Run **Qwen3.5-35B-A3B** locally on the DGX Spark and use it inside **openclaw** as a fully functional AI agent — including tool calls and on-demand reasoning mode.
+> **Fork of [ZengboJamesWang/Qwen3.5-35B-A3B-openclaw-dgx-spark](https://github.com/ZengboJamesWang/Qwen3.5-35B-A3B-openclaw-dgx-spark)** — adapted for **distributed inference across two DGX Sparks**, enabling much larger models.
+
+Run **Qwen3.5-122B-A10B** (or larger) locally on a 2× DGX Spark cluster and use it inside **openclaw** as a fully functional AI agent — including tool calls and on-demand reasoning mode.
+
+## What changed from the original
+
+| Change | Why |
+|--------|-----|
+| Build with `-DGGML_RPC=ON -DCMAKE_CUDA_ARCHITECTURES=121` | RPC enables distributed inference; CUDA 13 supports sm_121 natively |
+| Added `rpc-server` on worker node | Exposes the second Spark's GPU + memory to the master |
+| `llama-server --rpc <worker_ip>:50052` | Splits model weights and KV cache across both nodes |
+| New `scripts/download-model.sh` | Downloads GGUF once, syncs to both Sparks over ConnectX-7 |
+| New `systemd/llama-rpc-worker.service` | Manages the RPC worker as a systemd service |
+| Updated model & context sizes | Larger models need adjusted context budgets |
+
+---
 
 ## Hardware
 
-Tested on **NVIDIA DGX Spark** (GB10 Superchip, sm_121, ~122 GB unified memory).  
-The Qwen3.5-35B-A3B MoE model uses ~20 GB, leaving ~100 GB free for context and other workloads.
+Two **NVIDIA DGX Spark** units (GB10 Superchip, sm_121) connected via ConnectX-7.
 
-| Metric | Value |
-|--------|-------|
-| Generation speed | ~43 tok/s |
-| Prefill speed | ~63 tok/s |
-| Context window | 128k tokens |
+| Metric | Single Spark | 2× Cluster |
+|--------|-------------|------------|
+| Unified memory | ~128 GB | **~256 GB** |
+| Memory bandwidth | 273 GB/s | 273 GB/s per node |
+| Interconnect | — | 200 Gb/s RDMA (ConnectX-7) |
+| Max model (Q4) | ~70 GB | **~240 GB** |
+
+### Which models fit
+
+| Model | Quant | Size | Fits on | Notes |
+|-------|-------|------|---------|-------|
+| Qwen3.5-35B-A3B | UD-Q4_K_XL | ~21 GB | 1× Spark | Use [original guide](https://github.com/ZengboJamesWang/Qwen3.5-35B-A3B-openclaw-dgx-spark) |
+| Qwen3.5-122B-A10B | Q4_K_M | ~70 GB | 1× or 2× Spark | Splits load across both GPUs on 2× |
+| Qwen3-235B-A22B | UD-Q4_K_XL | ~140 GB | 2× Spark | Qwen3 flagship MoE |
+| **Qwen3.5-397B-A17B** | **Q3_K_M** | **~189 GB** | **2× Spark** | **Qwen3.5 flagship** |
+| Qwen3.5-397B-A17B | Q4_K_M | ~241 GB | 2× Spark | Tight — ~15 GB for KV cache |
 
 ---
 
@@ -19,11 +44,13 @@ The Qwen3.5-35B-A3B MoE model uses ~20 GB, leaving ~100 GB free for context and 
 
 | File | Purpose |
 |------|---------|
-| `scripts/install.sh` | Builds llama.cpp from source with CUDA (sm_121) and downloads the model |
-| `scripts/setup-openclaw.sh` | Installs the proxy and systemd units |
+| `scripts/install.sh` | Builds llama.cpp with CUDA + **RPC** on both nodes |
+| `scripts/download-model.sh` | Downloads GGUF model, syncs to both Sparks over ConnectX-7 |
+| `scripts/setup-openclaw.sh` | Installs proxy + systemd units on the master node |
 | `proxy/llama-proxy.py` | Proxy that makes llama-server compatible with openclaw |
-| `systemd/llama-server.service` | systemd unit for llama-server (port 8001) |
-| `systemd/llama-proxy.service` | systemd unit for the proxy (port 8000) |
+| `systemd/llama-rpc-worker.service` | systemd unit for rpc-server on the **worker** node (port 50052) |
+| `systemd/llama-server.service` | systemd unit for llama-server on the **master** node (port 8001) |
+| `systemd/llama-proxy.service` | systemd unit for the proxy on the **master** node (port 8000) |
 | `openclaw/provider-snippet.json` | Drop-in config snippet for `~/.openclaw/openclaw.json` |
 
 ---
@@ -31,186 +58,134 @@ The Qwen3.5-35B-A3B MoE model uses ~20 GB, leaving ~100 GB free for context and 
 ## Quick start
 
 ```bash
-# 1. Build llama.cpp and download model
+# === On BOTH nodes ===
+# 1. Build llama.cpp with CUDA + RPC
 sudo bash scripts/install.sh
 
-# 2. Install proxy + systemd services
+# === On the MASTER node only ===
+# 2. Download model and sync to worker
+bash scripts/download-model.sh unsloth/Qwen3.5-122B-A10B-GGUF "Q4_K_M/*"
+
+# === On the WORKER node ===
+# 3. Start the RPC worker
+sudo cp systemd/llama-rpc-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now llama-rpc-worker
+
+# === On the MASTER node ===
+# 4. Install proxy + systemd services
 sudo bash scripts/setup-openclaw.sh
 
-# 3. Add the provider to openclaw (see Section 3 below)
+# 5. Add the provider to openclaw (see Section 4 below)
 ```
 
 ---
 
-## Section 1 — Install llama.cpp and the Qwen model
+## Section 0 — Network setup
 
-See [`scripts/install.sh`](scripts/install.sh) for the full automated script, or follow the steps below manually.
+Connect the two Sparks via QSFP cable using the ConnectX-7 ports.
 
-### Prerequisites
+Your DGX OS setup script likely already configured this. Verify:
+
+```bash
+ip link show | grep -A1 'enp1s0f1np1\|enP2p1s0f1np1'
+ip -4 addr show enp1s0f1np1
+```
+
+Note the IPs. Throughout this guide:
+- **Master** (runs llama-server + proxy): `192.168.0.124`
+- **Worker** (runs rpc-server): `192.168.0.122`
+
+Replace these with your actual IPs.
+
+---
+
+## Section 1 — Build llama.cpp (both nodes)
+
+See [`scripts/install.sh`] for the full automated script, or follow manually:
 
 ```bash
 sudo apt-get install -y git cmake build-essential patchelf
-# CUDA toolkit must already be installed (comes with DGX Spark OS image)
-```
+export PATH=/usr/local/cuda/bin:$PATH
 
-### Build llama.cpp
-
-```bash
-git clone https://github.com/ggerganov/llama.cpp /opt/llama.cpp
-cd /opt/llama.cpp
+git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp
+cd ~/llama.cpp
 
 cmake -B build \
   -DGGML_CUDA=ON \
+  -DGGML_RPC=ON \
   -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=120
+  -DCMAKE_CUDA_ARCHITECTURES=121
+
 cmake --build build --config Release -j $(nproc)
 
-# Make binary available system-wide
-ln -sf /opt/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
-
-# Register shared libs
-echo "/opt/llama.cpp/build/bin" > /etc/ld.so.conf.d/llama.conf
-ldconfig
+# Create venv for huggingface-cli
+python3 -m venv ~/llama.cpp/.venv
+~/llama.cpp/.venv/bin/pip install huggingface_hub hf_transfer
 ```
 
-> **Note on CUDA arch:** GB10 is `sm_121`. The build uses `120` (the closest supported
-> target in current llama.cpp). Do not use `native` — cmake may fail to detect sm_121.
+> **Key differences from single-node guide:**
+> - `-DGGML_RPC=ON` — enables the RPC backend for distributed inference
+> - `-DCMAKE_CUDA_ARCHITECTURES=121` — CUDA 13 supports sm_121 natively (the original guide used `120`)
 
-### Download the model
+---
+
+## Section 2 — Download the model
 
 ```bash
-mkdir -p /opt/llama.cpp/models
-pip install huggingface_hub
+# Qwen3.5-122B-A10B at Q4_K_M (~70 GB, 3 shards)
+bash scripts/download-model.sh unsloth/Qwen3.5-122B-A10B-GGUF "Q4_K_M/*"
 
-huggingface-cli download \
-  unsloth/Qwen3.5-35B-A3B-GGUF \
-  --include "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" \
-  --local-dir /opt/llama.cpp/models/
+# Or: Qwen3.5-397B-A17B at Q3_K_M (~189 GB)
+bash scripts/download-model.sh unsloth/Qwen3.5-397B-A17B-GGUF "Q3_K_M/*"
+
+# Override worker IP:
+REMOTE_HOST=192.168.0.122 bash scripts/download-model.sh ...
 ```
 
-**Why this model?**
-- `UD` = Unsloth Dynamic quantisation — smarter bit allocation than standard Q4_K_XL
-- Only ~20 GB vs ~37 GB for the original full-size quant
-- ~43 tok/s on GB10 vs ~21 tok/s for the larger quant
+---
 
-### Start llama-server
+## Section 3 — Start the cluster
+
+```
+openclaw  →  port 8000 (llama-proxy)  →  port 8001 (llama-server, MASTER)
+                                               ↕ RPC (TCP)
+                                         port 50052 (rpc-server, WORKER)
+```
+
+### Worker: start rpc-server
 
 ```bash
-llama-server \
-  --model /opt/llama.cpp/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
-  --ctx-size 131072 \
+~/llama.cpp/build/bin/rpc-server --host 192.168.0.122 --port 50052 -c
+```
+
+### Master: start llama-server
+
+```bash
+~/llama.cpp/build/bin/llama-server \
+  --model ~/llama-models/unsloth--Qwen3.5-122B-A10B-GGUF/Qwen3.5-122B-A10B-Q4_K_M-00001-of-00003.gguf \
+  --ctx-size 65536 \
   --parallel 1 \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 8001 \
   -ngl 99 \
-  -fa on
+  -fa on \
+  --rpc 192.168.0.122:50052
 ```
-
-Key flags:
 
 | Flag | Effect |
 |------|--------|
-| `-ngl 99` | Offload all layers to GPU |
-| `-fa on` | Flash attention — significant speed boost |
-| `--parallel 1` | Best single-user throughput |
-| `--ctx-size 131072` | 128k context |
-| `--host 127.0.0.1` | Loopback only — the proxy is the public interface |
+| `--rpc <worker_ip>:50052` | Offload to the worker node |
+| `--ctx-size 65536` | Adjusted for larger models (reduce if OOM) |
+| `-ngl 99` | Offload all layers to GPU (both local and remote) |
+| `-fa on` | Flash attention |
 
-Verify it started:
-
-```bash
-curl http://127.0.0.1:8001/health
-# {"status":"ok"}
-```
+llama.cpp automatically splits model weights across both nodes proportionally.
 
 ---
 
-## Section 2 — Making it work with openclaw (the proxy)
+## Section 4 — Configure openclaw
 
-openclaw cannot talk to llama-server directly. Two incompatibilities need to be fixed:
-
-### Problem 1: Unknown message roles
-
-openclaw sends messages with roles that the Qwen3.5 Jinja chat template does not accept:
-
-| openclaw sends | Qwen3.5 expects | Fix |
-|----------------|-----------------|-----|
-| `"role": "developer"` | `"role": "system"` | Rewrite in proxy |
-| `"role": "toolResult"` | `"role": "tool"` | Rewrite in proxy |
-
-Without this fix, every request returns `HTTP 500: Unexpected message role.`
-
-### Problem 2: Thinking mode
-
-Qwen3.5 is a reasoning model. By default it spends tokens on a `<think>` block before
-answering. openclaw has no way to control this — the model would consume all its token
-budget thinking and return an empty `content` field.
-
-### The proxy
-
-`proxy/llama-proxy.py` is a lightweight Python proxy (stdlib only, no dependencies)
-that sits between openclaw and llama-server:
-
-```
-openclaw  →  port 8000 (llama-proxy)  →  port 8001 (llama-server)
-```
-
-It does three things on every request:
-
-1. Rewrites `developer` → `system` and `toolResult` → `tool`
-2. Injects `{"enable_thinking": false}` by default (fast direct answers)
-3. If the user's message starts with `[think]`, strips the keyword and injects
-   `{"enable_thinking": true}` instead (full reasoning mode)
-
-### Install the proxy as a systemd service
-
-```bash
-sudo bash scripts/setup-openclaw.sh
-```
-
-Or manually:
-
-```bash
-# Copy proxy script
-cp proxy/llama-proxy.py /opt/llama.cpp/llama-proxy.py
-
-# Install systemd units
-cp systemd/llama-server.service /etc/systemd/system/
-cp systemd/llama-proxy.service  /etc/systemd/system/
-
-systemctl daemon-reload
-systemctl enable llama-server llama-proxy
-systemctl start  llama-server llama-proxy
-```
-
-Verify:
-
-```bash
-curl http://127.0.0.1:8000/health
-# {"status":"ok"}
-```
-
-### Using `[think]` mode
-
-Prefix any message in openclaw with `[think]` to enable reasoning:
-
-```
-[think] why is my recursive fibonacci O(2^n) and how do I fix it?
-```
-
-The keyword is stripped before the model sees it. The response will include the model's
-full reasoning chain alongside the answer.  
-Use it for: hard debugging, complex architecture decisions, math, logic.
-
----
-
-## Section 3 — Configure openclaw
-
-Add the `llamacpp` provider to `~/.openclaw/openclaw.json`.
-
-The full snippet is in [`openclaw/provider-snippet.json`](openclaw/provider-snippet.json).
-
-In your `openclaw.json`, merge the following into `"models" > "providers"`:
+Add the `llamacpp` provider to `~/.openclaw/openclaw.json` (see `openclaw/provider-snippet.json`):
 
 ```json
 "llamacpp": {
@@ -219,75 +194,52 @@ In your `openclaw.json`, merge the following into `"models" > "providers"`:
   "api": "openai-completions",
   "models": [
     {
-      "id": "Qwen3.5-35B-A3B",
-      "name": "Qwen3.5-35B-A3B (local)",
+      "id": "Qwen3.5-122B-A10B",
+      "name": "Qwen3.5-122B-A10B (local, 2× Spark)",
       "reasoning": true,
       "input": ["text"],
       "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-      "contextWindow": 131072,
-      "maxTokens": 32768
+      "contextWindow": 65536,
+      "maxTokens": 16384
     }
   ]
 }
 ```
 
-And in `"agents" > "defaults" > "models"`, add an alias:
-
-```json
-"llamacpp/Qwen3.5-35B-A3B": {
-  "alias": "qwen"
-}
-```
-
-You can now select the model in openclaw with `/model qwen` or set it as your primary
-model in the `agents.defaults.model.primary` field.
-
-### Verify tool calls work
-
-Send a message that triggers a tool (e.g. a web search). If the proxy is running and
-the roles are being rewritten, the tool call will complete without errors.
+Select with `/model qwen` after adding the alias.
 
 ---
 
-## Rebuilding after upstream updates
+## Performance
 
-```bash
-cd /opt/llama.cpp
-git pull
-cmake --build build --config Release -j $(nproc)
-sudo systemctl restart llama-server
-```
+Tested with Qwen3.5-122B-A10B Q4_K_M on 2× DGX Spark:
 
----
-
-## GPU memory reference (NVIDIA GB10)
-
-| Model | Quant | VRAM |
-|-------|-------|------|
-| Qwen3.5-35B-A3B | UD-Q4_K_XL | ~20 GB |
-| Qwen3.5-35B-A3B | Q4_K_XL (original) | ~37 GB |
-| 70B dense | Q4_K_M | ~40 GB |
-| 120B dense | Q4_K_M | ~70 GB |
-
-Total unified memory: ~122 GB. KV cache adds on top of model size (~0.5 GB per 32k context with flash attention).
+| Metric | Value |
+|--------|-------|
+| Prefill speed | ~70 tok/s |
+| Generation speed | ~20 tok/s |
+| Context window | 65536 tokens |
 
 ---
 
 ## Troubleshooting
 
-### `HTTP 500: Unexpected message role`
-The proxy is not running or openclaw is not pointing at port 8000.
+### `CUDA error: no kernel image is available for execution`
+Rebuild **both nodes** with `-DCMAKE_CUDA_ARCHITECTURES=121`.
+
+### `Remote RPC server crashed or returned malformed response`
+Check rpc-server log: `sudo journalctl -u llama-rpc-worker -n 50`
+Most common cause: CUDA arch mismatch.
+
+### Worker unreachable
 ```bash
-systemctl status llama-proxy
-curl http://127.0.0.1:8000/health
+sudo ufw allow 50052/tcp  # on worker
+iperf3 -s                 # on worker
+iperf3 -c <worker_ip>     # on master
 ```
 
-### No response / empty content
-The model is in thinking mode and exhausted its token budget before answering.
-Make sure the proxy is running — it injects `enable_thinking: false` by default.
+### `HTTP 500: Unexpected message role`
+The proxy is not running: `systemctl status llama-proxy`
 
-### Slow first response
-Normal — the model needs to load into GPU memory on first request (~5s). Subsequent requests are fast.
-
-### `CUDA error: no kernel image is available for execution`
-Your llama.cpp build targeted the wrong CUDA arch. Rebuild with `-DCMAKE_CUDA_ARCHITECTURES=120`.
+### `huggingface-cli: command not found`
+Use `~/llama.cpp/.venv/bin/hf download ...` — the CLI is named `hf` in huggingface_hub >= 1.x.

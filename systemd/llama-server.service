@@ -1,24 +1,30 @@
+# llama-server.service — MASTER node
+# NOTE: setup-openclaw.sh generates this with correct paths/user.
+#       This file is a reference template.
 [Unit]
-Description=llama.cpp server (Qwen3.5-35B-A3B)
-After=network.target
+Description=llama.cpp server (distributed, 2× DGX Spark)
+After=network-online.target
+Wants=network-online.target
 Before=llama-proxy.service
 
 [Service]
 Type=simple
 User=YOUR_USERNAME
-ExecStart=/usr/local/bin/llama-server \
-    --model /opt/llama.cpp/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf \
-    --ctx-size 131072 \
+Environment=PATH=/usr/local/cuda/bin:/usr/bin:/bin
+ExecStart=/home/YOUR_USERNAME/llama.cpp/build/bin/llama-server \
+    --model /home/YOUR_USERNAME/llama-models/MODEL_DIR/MODEL-00001-of-00003.gguf \
+    --ctx-size 65536 \
     --parallel 1 \
-    --host 127.0.0.1 \
+    --host 0.0.0.0 \
     --port 8001 \
     -ngl 99 \
-    -fa on
+    -fa on \
+    --rpc 192.168.0.122:50052
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/var/log/llama-server.log
 StandardError=append:/var/log/llama-server.log
-TimeoutStartSec=300
+TimeoutStartSec=600
 
 [Install]
 WantedBy=multi-user.target

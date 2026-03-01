@@ -8,8 +8,8 @@
       "api": "openai-completions",
       "models": [
         {
-          "id": "Qwen3.5-35B-A3B",
-          "name": "Qwen3.5-35B-A3B (local)",
+          "id": "Qwen3.5-122B-A10B",
+          "name": "Qwen3.5-122B-A10B (local, 2× Spark)",
           "reasoning": true,
           "input": ["text"],
           "cost": {
@@ -18,8 +18,8 @@
             "cacheRead": 0,
             "cacheWrite": 0
           },
-          "contextWindow": 131072,
-          "maxTokens": 32768
+          "contextWindow": 65536,
+          "maxTokens": 16384
         }
       ]
     }
@@ -27,6 +27,6 @@
 
   "_comment_alias": "Add this entry inside your existing agents.defaults.models object",
   "agents.defaults.models": {
-    "llamacpp/Qwen3.5-35B-A3B": { "alias": "qwen" }
+    "llamacpp/Qwen3.5-122B-A10B": { "alias": "qwen" }
   }
 }
